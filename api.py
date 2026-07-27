@@ -119,7 +119,131 @@ def _read_uploaded_file(upload_file: UploadFile) -> pd.DataFrame:
     except Exception as e:
         logger.exception("Failed to parse uploaded file: %s", e)
         raise HTTPException(status_code=400, detail=f"Failed to parse uploaded file: {e}")
+        
+def normalize_transactions_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the DataFrame has 'date' (datetime) and 'amount' (float, positive credit, negative debit).
+    Supports common alternative column names and debit/credit split columns.
 
+    Raises HTTPException(400) with a clear message if normalization fails.
+    """
+    if df is None or len(df) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or unreadable")
+
+    # map of common alternatives
+    date_candidates = ["date", "txn_date", "transaction_date", "posted_date", "value_date", "booking_date"]
+    amount_candidates = ["amount", "amt", "transaction_amount", "trans_amount", "value", "amount_in", "amount_out", "txn_amt"]
+    debit_candidates = ["debit", "debits", "debit_amt", "withdrawal"]
+    credit_candidates = ["credit", "credits", "credit_amt", "deposit"]
+
+    cols = {c.lower(): c for c in df.columns}  # map lowercase -> original column name
+
+    # find date column
+    date_col = None
+    for cand in date_candidates:
+        if cand in cols:
+            date_col = cols[cand]
+            break
+
+    # find amount column directly
+    amount_col = None
+    for cand in amount_candidates:
+        if cand in cols:
+            amount_col = cols[cand]
+            break
+
+    # find separate debit/credit columns if amount not found
+    debit_col = None
+    credit_col = None
+    for cand in debit_candidates:
+        if cand in cols:
+            debit_col = cols[cand]
+            break
+    for cand in credit_candidates:
+        if cand in cols:
+            credit_col = cols[cand]
+            break
+
+    # If neither amount nor debit/credit, try to infer numeric column
+    if amount_col is None and debit_col is None and credit_col is None:
+        # pick the first numeric-looking column (float/int dtype or parsable)
+        for orig in df.columns:
+            ser = df[orig]
+            if pd.api.types.is_numeric_dtype(ser):
+                amount_col = orig
+                break
+
+    if date_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Feature computation failed: could not find a date column. "
+                "Expected one of: " + ", ".join(date_candidates) +
+                f". Found columns: {', '.join(df.columns)}"
+            ),
+        )
+
+    # Build amount column if needed
+    if amount_col:
+        amt = df[amount_col]
+    elif debit_col or credit_col:
+        # create signed amount: credit positive, debit negative
+        credit_ser = pd.to_numeric(df[credit_col], errors="coerce") if credit_col else 0
+        debit_ser = pd.to_numeric(df[debit_col], errors="coerce") if debit_col else 0
+        # some spreadsheets put NaN in missing columns; fillna(0)
+        credit_ser = credit_ser.fillna(0)
+        debit_ser = debit_ser.fillna(0)
+        amt = credit_ser - debit_ser
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Feature computation failed: could not find an amount column. "
+                "Expected one of: " + ", ".join(amount_candidates + debit_candidates + credit_candidates) +
+                f". Found columns: {', '.join(df.columns)}"
+            ),
+        )
+
+    # Clean amount series: remove currency symbols, commas, parentheses
+    def clean_amount_series(s: pd.Series) -> pd.Series:
+        if pd.api.types.is_numeric_dtype(s):
+            return s.astype(float)
+        s = s.astype(str).str.strip()
+        # remove common characters
+        s = s.str.replace(r"[^\d\.\-]", "", regex=True)
+        # convert empty strings to NaN
+        s = s.replace("", float("nan"))
+        return pd.to_numeric(s, errors="coerce")
+
+    amt_clean = clean_amount_series(amt)
+    if amt_clean.isna().all():
+        raise HTTPException(
+            status_code=400,
+            detail="Feature computation failed: amount column could not be parsed as numbers. Check for currency symbols or formatting."
+        )
+
+    # Parse dates
+    dates = pd.to_datetime(df[date_col], errors="coerce", dayfirst=False)
+    if dates.isna().all():
+        # try dayfirst True as fallback
+        dates = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+    if dates.isna().all():
+        raise HTTPException(
+            status_code=400,
+            detail="Feature computation failed: date column could not be parsed. Ensure date column has parseable dates (YYYY-MM-DD etc)."
+        )
+
+    # Build normalized DataFrame
+    out = df.copy()
+    out["date"] = dates
+    out["amount"] = amt_clean
+
+    # Remove rows where date or amount is missing (or optionally keep)
+    out = out.dropna(subset=["date", "amount"]).reset_index(drop=True)
+    if out.empty:
+        raise HTTPException(status_code=400, detail="After parsing, no valid transactions remain (check dates/amounts).")
+
+    return out
 
 def _pick_top_features(component_scores: Dict[str, float], raw: Dict[str, Any], top_k: int = 2) -> List[Dict[str, Any]]:
     """Simple heuristic to pick 1-2 most valuable features per component scores and raw fields."""
