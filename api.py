@@ -288,9 +288,18 @@ async def score_file(file: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error reading file: {e}")
 
-    # normalize common column names
-    if "amount" not in df.columns and "amt" in df.columns:
-        df = df.rename(columns={"amt": "amount"})
+    # Normalize required columns (will raise HTTPException(400) with clear message on failure)
+    try:
+        df = normalize_transactions_df(df)
+    except HTTPException as he:
+        # propagate client error
+        raise he
+    except Exception as e:
+        logger.exception("Normalization failed: %s", e)
+        raise HTTPException(status_code=400, detail=f"Failed to normalize uploaded file: {e}")
+
+    # At this point df has 'date' (datetime) and 'amount' (float)
+    # Normalize other common names
     if "description" not in df.columns and "memo" in df.columns:
         df = df.rename(columns={"memo": "description"})
 
