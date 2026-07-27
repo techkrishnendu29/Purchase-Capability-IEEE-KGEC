@@ -22,7 +22,7 @@ from scoring.loan_eligibility import evaluate_loan_eligibility
 from scoring.risk_analysis import risk_bucket_from_score
 from scoring.explainability import generate_explanations
 
-# Optional ML helpers (may not exist in all setups)
+# Optional ML helpers
 try:
     from preprocessing.ml_categorizer import load_model as ml_load_model, predict_categories  # type: ignore
     ML_HELPERS_AVAILABLE = True
@@ -31,16 +31,16 @@ except Exception:
     predict_categories = None  # type: ignore
     ML_HELPERS_AVAILABLE = False
 
-# fallback joblib load if needed
+# joblib fallback loader
 try:
     from joblib import load as joblib_load  # type: ignore
-except Exception:  # joblib may not be installed; it's recommended in requirements.txt
+except Exception:
     joblib_load = None  # type: ignore
 
 logger = logging.getLogger("prosperity_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-app = FastAPI(title="ProsperityScore API (final)")
+app = FastAPI(title="ProsperityScore API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,19 +49,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Model config from environment
+# Config / Model
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "models/ml_model.pkl"))
 USE_ML_ENV = os.environ.get("USE_ML", "false").lower()
 REQUEST_USE_ML = USE_ML_ENV in ("1", "true", "yes")
 
-# In-memory ML model object (if loaded)
 ML_MODEL = None
 ML_MODEL_LOADED = False
 
+
 def try_load_ml_model():
+    """Attempt to load ML model into ML_MODEL if REQUEST_USE_ML is true."""
     global ML_MODEL, ML_MODEL_LOADED
     if not REQUEST_USE_ML:
-        logger.info("USE_ML not enabled; ML categorizer disabled.")
+        logger.info("USE_ML not enabled; ML disabled.")
         ML_MODEL = None
         ML_MODEL_LOADED = False
         return
@@ -72,31 +73,31 @@ def try_load_ml_model():
         ML_MODEL_LOADED = False
         return
 
-    # Preferred: use preprocessing.ml_categorizer.load_model if available
+    # Preferred: use ml_categorizer.load_model if available
     if ML_HELPERS_AVAILABLE and ml_load_model is not None:
         try:
             ML_MODEL = ml_load_model(str(MODEL_PATH))
             ML_MODEL_LOADED = True
-            logger.info("Loaded ML model via ml_categorizer.load_model from %s", MODEL_PATH)
+            logger.info("Loaded ML model via preprocessing.ml_categorizer.load_model from %s", MODEL_PATH)
             return
-        except Exception as e:
-            logger.exception("ml_categorizer.load_model failed: %s", e)
+        except Exception:
+            logger.exception("preprocessing.ml_categorizer.load_model failed; falling back to joblib.load if available")
 
-    # Fallback: joblib.load if available
+    # Fallback: joblib.load
     if joblib_load is not None:
         try:
             ML_MODEL = joblib_load(str(MODEL_PATH))
             ML_MODEL_LOADED = True
             logger.info("Loaded ML model via joblib from %s", MODEL_PATH)
             return
-        except Exception as e:
-            logger.exception("joblib.load failed to load model at %s: %s", MODEL_PATH, e)
+        except Exception:
+            logger.exception("joblib.load failed to load model at %s", MODEL_PATH)
 
-    logger.warning("ML model could not be loaded even though USE_ML=true and MODEL_PATH exists.")
+    logger.warning("ML model could not be loaded despite REQUEST_USE_ML; ML disabled.")
     ML_MODEL = None
     ML_MODEL_LOADED = False
 
-# load ML model at startup attempt
+# Try load on startup
 try_load_ml_model()
 
 
@@ -106,7 +107,7 @@ def health():
         content={
             "status": "ok",
             "model_path": str(MODEL_PATH) if MODEL_PATH.exists() else None,
-            "use_ml_requested": REQUEST_USE_ML,
+            "request_use_ml": REQUEST_USE_ML,
             "ml_helpers_available": ML_HELPERS_AVAILABLE,
             "ml_model_loaded": ML_MODEL_LOADED,
             "cwd": str(Path.cwd()),
@@ -116,7 +117,6 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    """Simple landing + upload form to test /score."""
     health_json = health().body.decode() if isinstance(health().body, (bytes, bytearray)) else str(health().body)
     html = f"""
     <!doctype html>
@@ -125,7 +125,7 @@ def index(request: Request):
       <body style="font-family:Arial,Helvetica,sans-serif; margin:30px;">
         <h1>ProsperityScore API</h1>
         <p>Health: <pre>{health_json}</pre></p>
-        <h3>Upload a CSV / XLS / XLSX bank statement</h3>
+        <h3>Upload transactions file (CSV / XLS / XLSX)</h3>
         <input id="file" type="file" accept=".csv,.xls,.xlsx"/>
         <button id="send">Upload & Score</button>
         <pre id="out"></pre>
@@ -186,7 +186,7 @@ def _pick_top_features(component_scores: Dict[str, float], raw: Dict[str, Any], 
 async def score_file(file: UploadFile = File(...)):
     """
     Accept one uploaded CSV/XLS/XLSX file, parse using preprocessing.loader.load_transaction_files,
-    categorize (ML if enabled and available, else rule-based), compute features, score & return JSON.
+    (optionally) categorize with ML, else rule-based, compute features & scoring and return JSON.
     """
     fname = (file.filename or "upload").strip()
     ext = Path(fname).suffix.lower()
@@ -195,53 +195,50 @@ async def score_file(file: UploadFile = File(...)):
 
     tmp_path = None
     try:
-        # write uploaded content to a temporary file for loader to read
+        # write uploaded content to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp_path = tmp.name
             content = await file.read()
             tmp.write(content)
             tmp.flush()
 
-        # parse & normalize using your loader
+        # parse using loader (robust header discovery and normalization)
         try:
             df = load_transaction_files([tmp_path])
         except Exception as e:
             logger.exception("Loader failed to parse uploaded file: %s", e)
-            # return helpful 400
             raise HTTPException(status_code=400, detail=f"Failed to parse uploaded file: {e}")
 
         if df is None or df.empty:
             raise HTTPException(status_code=400, detail="Uploaded file parsed but returned no transactions")
 
-        # Categorize: prefer ML if enabled and available
+        # categorize (prefer ML if requested & loaded)
         df_cat = None
         if REQUEST_USE_ML and ML_MODEL_LOADED and predict_categories is not None:
             try:
-                # predict_categories signature in your code accepts model and out_col
                 df_cat = predict_categories(df, text_cols=("description", "payee"), model=ML_MODEL, out_col="category")
-                logger.info("Categorized transactions using ML predict_categories")
-            except Exception as e:
-                logger.exception("ML predict_categories failed, falling back to rule-based: %s", e)
+                logger.info("Categorized using ML predict_categories")
+            except Exception:
+                logger.exception("ML predict_categories failed; falling back to rule-based")
                 df_cat = None
 
         if df_cat is None:
             try:
-                # categorize_transactions from preprocessing.categorizer will use external rule module if present
                 df_cat = categorize_transactions(df, text_cols=("description", "payee"), use_ml=False)
-                logger.info("Categorized transactions using rule-based categorize_transactions")
-            except Exception as e:
-                logger.exception("Rule-based categorizer failed; proceeding with uncategorized rows: %s", e)
+                logger.info("Categorized using rule-based categorize_transactions")
+            except Exception:
+                logger.exception("Rule-based categorize_transactions failed; proceeding with uncategorized")
                 df_cat = df.copy()
                 df_cat["category"] = "Uncategorized"
 
-        # Compute features
+        # compute features
         try:
             features = compute_all_features(df_cat)
         except Exception as e:
             logger.exception("Feature computation failed: %s", e)
             raise HTTPException(status_code=500, detail=f"Feature computation failed: {e}")
 
-        # Scoring, eligibility, risk, explanations
+        # scoring pipeline
         try:
             scoring = compute_final_score(features["component_scores"])
             eligibility = evaluate_loan_eligibility(features, scoring["final_score"])
@@ -251,7 +248,7 @@ async def score_file(file: UploadFile = File(...)):
             logger.exception("Scoring pipeline failed: %s", e)
             raise HTTPException(status_code=500, detail=f"Scoring pipeline failed: {e}")
 
-        # Top features heuristic
+        # pick top features
         try:
             top_features = _pick_top_features(features["component_scores"], features["raw"], top_k=2)
         except Exception:
