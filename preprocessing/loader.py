@@ -1,4 +1,3 @@
-# preprocessing/loader.py
 import pandas as pd
 import numpy as np
 import re
@@ -47,9 +46,24 @@ def _is_excel_serial_like(series: pd.Series) -> float:
     return float(mask.sum() / numeric.size)
 
 
+def _parse_dates(series: pd.Series, dayfirst: bool = False) -> pd.Series:
+    """
+    Safe wrapper around pd.to_datetime that avoids passing `infer_datetime_format`
+    (removed in newer pandas). Returns a datetime Series with invalid parses as NaT.
+    """
+    try:
+        return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
+    except TypeError:
+        # Defensive fallback: call without dayfirst if unexpected signature
+        try:
+            return pd.to_datetime(series, errors="coerce")
+        except Exception:
+            return pd.Series([pd.NaT] * len(series))
+
+
 def _fraction_parsable_dates(series: pd.Series) -> float:
     """Attempt to parse series to datetime; return fraction successfully parsed."""
-    parsed = pd.to_datetime(series, errors="coerce", dayfirst=False, infer_datetime_format=True)
+    parsed = _parse_dates(series, dayfirst=False)
     if parsed.size == 0:
         return 0.0
     return float(parsed.notna().sum() / parsed.size)
@@ -193,7 +207,7 @@ def load_transaction_files(paths: List[str]) -> pd.DataFrame:
 
         # Parse/convert date column, handling excel serials if needed
         series = df_read[date_col]
-        parsed = pd.to_datetime(series, errors="coerce", dayfirst=False, infer_datetime_format=True)
+        parsed = _parse_dates(series, dayfirst=False)
         frac_parsed = parsed.notna().mean() if parsed.size else 0.0
         if frac_parsed < 0.5:
             # maybe numeric serials
@@ -203,7 +217,7 @@ def load_transaction_files(paths: List[str]) -> pd.DataFrame:
                 parsed = _convert_excel_serial_to_datetime(series)
             else:
                 # try more permissive parsing (dayfirst True)
-                parsed_alt = pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
+                parsed_alt = _parse_dates(series, dayfirst=True)
                 if parsed_alt.notna().mean() > frac_parsed:
                     parsed = parsed_alt
         df_read[date_col] = parsed
