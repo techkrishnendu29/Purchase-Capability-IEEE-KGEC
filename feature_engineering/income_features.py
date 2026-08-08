@@ -47,7 +47,8 @@ def compute_monthly_income_series(
     amount_col: str = "amount",
 ) -> pd.Series:
     """
-    Return a pandas Series indexed by month timestamp with aggregated gross income (sum of positive amounts).
+    Return a pandas Series indexed by month timestamp (month-end) with aggregated gross income (sum of positive amounts).
+    This implementation groups by month PeriodIndex to be robust across pandas versions.
     """
     if date_col not in df.columns or amount_col not in df.columns:
         raise ValueError(f"DataFrame must contain columns {date_col!r} and {amount_col!r}")
@@ -64,10 +65,10 @@ def compute_monthly_income_series(
         return pd.Series(dtype=float)
 
     incomes.set_index("date", inplace=True)
-    monthly = incomes["amount"].resample("M").sum().sort_index()
-    # monthly index is Timestamp at month end (resample default)
+    # Group by month PeriodIndex (robust across pandas versions), then convert periods to month-end timestamps
+    monthly = incomes["amount"].groupby(incomes.index.to_period("M")).sum().sort_index()
+    monthly.index = monthly.index.to_timestamp(how="end")
     return monthly
-
 
 def _normalize_0_1(x: float, min_val: float, max_val: float) -> float:
     if max_val <= min_val:
