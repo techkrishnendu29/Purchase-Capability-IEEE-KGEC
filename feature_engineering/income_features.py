@@ -47,7 +47,7 @@ def compute_monthly_income_series(
     amount_col: str = "amount",
 ) -> pd.Series:
     """
-    Return a pandas Series indexed by month period (YYYY-MM) with aggregated income (sum of positive amounts).
+    Return a pandas Series indexed by month timestamp with aggregated gross income (sum of positive amounts).
     """
     if date_col not in df.columns or amount_col not in df.columns:
         raise ValueError(f"DataFrame must contain columns {date_col!r} and {amount_col!r}")
@@ -55,18 +55,17 @@ def compute_monthly_income_series(
     dates = _ensure_datetime(df, date_col)
     amounts = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
 
-    temp = pd.DataFrame({ "date": dates, "amount": amounts })
+    temp = pd.DataFrame({"date": dates, "amount": amounts})
     temp = temp.dropna(subset=["date"])
     # consider incomes as positive amounts
     incomes = temp[temp["amount"] > 0].copy()
     if incomes.empty:
-        # return empty series with monthly period index
+        # return empty series with monthly timestamp index
         return pd.Series(dtype=float)
 
-    incomes["period"] = incomes["date"].dt.to_period("M")
-    monthly = incomes.groupby("period")["amount"].sum().sort_index()
-    # convert PeriodIndex to datetime period start for regressions if needed
-    monthly.index = monthly.index.to_timestamp()
+    incomes.set_index("date", inplace=True)
+    monthly = incomes["amount"].resample("M").sum().sort_index()
+    # monthly index is Timestamp at month end (resample default)
     return monthly
 
 
@@ -82,22 +81,26 @@ def compute_income_features(
     date_col: str = "date",
     amount_col: str = "amount",
     source_col: Optional[str] = "payee",
+    effective_fraction: float = 0.85,
     min_months_for_growth: int = 3,
 ) -> IncomeFeatures:
     """
     Compute income-related features from transactions DataFrame.
 
-    Returns an IncomeFeatures dataclass where:
-    - stability/consistency: 1 - (std / mean) clipped to 0..1
-    - source diversity score: normalized inverse of number of unique payers/sources (1 = single consistent source)
-    - growth_score: based on linear regression slope; normalized against historical absolute values
-    - income_component_score: combined metric mapped to 0..100 for the final pipeline
+    Args:
+      df: transactions DataFrame with at least date_col and amount_col.
+      date_col: name of date column
+      amount_col: name of amount column (credits positive)
+      source_col: optional column name used to compute source diversity (payee)
+      effective_fraction: fraction of gross credit income considered as effective/net income (e.g., 0.85)
+      min_months_for_growth: minimum months to run growth regression
+
+    Returns:
+      IncomeFeatures dataclass
     """
-
-    monthly = compute_monthly_income_series(df, date_col, amount_col)
-
-    if monthly.empty:
-        logger.debug("No positive income transactions found.")
+    # Defensive checks
+    if date_col not in df.columns or amount_col not in df.columns:
+        logger.debug("compute_income_features: missing required columns")
         return IncomeFeatures(
             avg_monthly_income=0.0,
             income_stability_score=0.0,
@@ -108,36 +111,60 @@ def compute_income_features(
             income_component_score=0.0,
         )
 
-    avg_monthly = float(monthly.mean())
-    std_monthly = float(monthly.std(ddof=0))
+    # Compute gross monthly income series (sum of credits)
+    monthly_gross = compute_monthly_income_series(df, date_col=date_col, amount_col=amount_col)
 
-    # Income stability/consistency: 1 - (std/mean) clipped to 0..1
-    if avg_monthly > 0:
-        stability = 1.0 - (std_monthly / avg_monthly)
+    if monthly_gross.empty:
+        logger.debug("compute_income_features: no positive income transactions found")
+        return IncomeFeatures(
+            avg_monthly_income=0.0,
+            income_stability_score=0.0,
+            income_consistency_score=0.0,
+            income_source_diversity_score=0.0,
+            income_growth_slope=0.0,
+            income_growth_score=0.0,
+            income_component_score=0.0,
+        )
+
+    # Apply effective fraction to each month's gross to get effective monthly income
+    effective_fraction = float(effective_fraction)
+    if effective_fraction < 0 or effective_fraction > 1:
+        logger.warning("effective_fraction out of bounds, clamping to [0,1]: %s", effective_fraction)
+        effective_fraction = float(np.clip(effective_fraction, 0.0, 1.0))
+
+    monthly_effective = monthly_gross * effective_fraction
+
+    # Average monthly effective income (use mean of available months)
+    avg_monthly_effective = float(monthly_effective.mean())
+
+    # Stability: 1 - (std/mean) on effective monthly amounts
+    std_effective = float(monthly_effective.std(ddof=0)) if len(monthly_effective) > 0 else 0.0
+    if avg_monthly_effective > 0:
+        stability = 1.0 - (std_effective / avg_monthly_effective)
     else:
         stability = 0.0
     stability = float(np.clip(stability, 0.0, 1.0))
 
-    # Source diversity: fewer unique sources = higher safety per your spec.
+    # Consistency alias
+    consistency = stability
+
+    # Source diversity: evaluate unique payees for positive (credit) transactions
     if source_col and source_col in df.columns:
-        sources = df.loc[pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) > 0, source_col]
-        unique_sources = sources.dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
+        credit_mask = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) > 0
+        sources = df.loc[credit_mask, source_col].dropna().astype(str).str.strip()
+        unique_sources = sources.replace("", np.nan).dropna().unique()
         n_sources = max(1, len(unique_sources))
     else:
-        # fallback: use description if payee not available
+        # fallback to description if payee not available
         if "description" in df.columns:
-            sources = df.loc[pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) > 0, "description"]
-            unique_sources = sources.dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
+            credit_mask = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0) > 0
+            sources = df.loc[credit_mask, "description"].dropna().astype(str).str.strip()
+            unique_sources = sources.replace("", np.nan).dropna().unique()
             n_sources = max(1, len(unique_sources))
         else:
             n_sources = 1
 
-    # Convert number of sources to a score where 1.0 = single source, and decreases with more sources.
-    # We'll use 1 / log(1 + n_sources) normalized to 0..1 for better scaling. Then clip.
-    diversity_raw = 1.0 / np.log1p(n_sources)
-    # normalize diversity_raw to 0..1 given reasonable bounds: [1/log(1+1), 1/log(1+10)] -> map to [1, ~0.43]; we clamp
-    diversity_score = float(np.clip((diversity_raw - 1.0) / (1.0 - (1.0/np.log1p(10))), -1.0, 1.0))
-    # simpler transform: map single source to 1.0, many sources (>=6) -> 0.0
+    # Map number of sources to diversity score: single source -> 1.0, many sources (>=6) -> 0.0, linear in-between
     if n_sources <= 1:
         diversity_score = 1.0
     elif n_sources >= 6:
@@ -145,43 +172,40 @@ def compute_income_features(
     else:
         diversity_score = float(np.clip(1.0 - (n_sources - 1) / 5.0, 0.0, 1.0))
 
-    # Income growth: linear regression on monthly totals (months as integer)
+    # Income growth: linear regression on monthly_effective series
     income_growth_slope = 0.0
     growth_score = 0.0
-    if len(monthly) >= min_months_for_growth:
-        X = np.arange(len(monthly)).reshape(-1, 1)  # month index
-        y = monthly.values.reshape(-1, 1)
+    if len(monthly_effective) >= min_months_for_growth:
+        y = monthly_effective.values.reshape(-1, 1)
+        X = (np.arange(len(y))).reshape(-1, 1)
         reg = LinearRegression()
         try:
             reg.fit(X, y)
-            slope = float(reg.coef_[0][0])  # currency per month
+            slope = float(reg.coef_[0][0])  # currency per month (effective)
             income_growth_slope = slope
-
-            # Normalize slope to a score in 0..1.
-            # We consider a reasonable slope range: [-mean, +mean], where mean = avg_monthly.
-            # Positive slope gives higher score; negative slope lowers it.
-            if avg_monthly > 0:
-                growth_score = float(np.clip((slope / avg_monthly) * 0.5 + 0.5, 0.0, 1.0))
+            # Normalize slope relative to mean monthly effective income to a 0..1 score
+            if avg_monthly_effective > 0:
+                # map slope/avg to [-inf..inf] then to [0..1] centered at 0 (0.5 neutral)
+                growth_score = float(np.clip((slope / avg_monthly_effective) * 0.5 + 0.5, 0.0, 1.0))
             else:
                 growth_score = 0.5 if slope == 0 else (1.0 if slope > 0 else 0.0)
         except Exception as e:
-            logger.exception("Income growth regression failed: %s", e)
+            logger.exception("compute_income_features: growth regression failed: %s", e)
             income_growth_slope = 0.0
             growth_score = 0.0
+    else:
+        # insufficient data -> neutral growth
+        growth_score = 0.5
+        income_growth_slope = 0.0
 
-    # Compose a final income component score 0..100:
-    # weights (example): avg_monthly normalized via log, stability 40%, diversity 20%, growth 40%
-    # Normalize average monthly income via log1p against itself + some smoothing to 0..1
-    avg_norm = 0.0
+    # Map average monthly effective income to a normalized value in 0..1 using log scaling to reduce outlier sensitivity
     try:
-        # use log scale to reduce sensitivity to outliers
-        avg_norm = float(np.clip(np.log1p(avg_monthly) / (np.log1p(avg_monthly) + 1.0), 0.0, 1.0))
+        avg_norm = float(np.clip(np.log1p(avg_monthly_effective) / (np.log1p(avg_monthly_effective) + 1.0), 0.0, 1.0))
     except Exception:
         avg_norm = 0.0
 
-    # final combined in 0..1
-    combined = 0.0
-    # weights chosen to reflect Income weight ~30% in the final score; internal composition can differ
+    # Combine into final income component score (0..100)
+    # Weights tuned to emphasize stability and average income reasonably; tweak to match your business rules
     w_avg = 0.3
     w_stab = 0.4
     w_div = 0.15
@@ -191,9 +215,9 @@ def compute_income_features(
     income_component_score = float(np.clip(combined * 100.0, 0.0, 100.0))
 
     return IncomeFeatures(
-        avg_monthly_income=avg_monthly,
+        avg_monthly_income=avg_monthly_effective,
         income_stability_score=stability,
-        income_consistency_score=stability,
+        income_consistency_score=consistency,
         income_source_diversity_score=diversity_score,
         income_growth_slope=income_growth_slope,
         income_growth_score=growth_score,
