@@ -368,13 +368,17 @@ async def score_file(file: UploadFile = File(...)):
             except Exception:
                 return default
 
-        def _round_or_zero(v):
+        def _round_or_none(v):
+            """Round numeric values to int, return None if value is None or cannot be parsed."""
             try:
                 if v is None:
-                    return 0
+                    return None
+                # treat NaN explicitly as None
+                if isinstance(v, (float, np.floating)) and np.isnan(v):
+                    return None
                 return int(round(float(v)))
             except Exception:
-                return 0
+                return None
 
         def infer_employment_type_from_features():
             # Try explicit inference first
@@ -416,47 +420,47 @@ async def score_file(file: UploadFile = File(...)):
             # Try keys from expense raw, or check category totals
             rent = _get_raw(["expense", "monthly_rent_estimate"], None) or _get_raw(["expense", "rent_monthly"], None)
             if rent is not None:
-                return _round_or_zero(rent)
+                return _round_or_none(rent)
             cat_totals = _get_raw(["expense", "category_totals"], None) or _get_raw(["expense_raw", "category_totals"], None)
             if isinstance(cat_totals, dict):
                 for k in ("rent", "house rent", "rental"):
                     if k in cat_totals:
-                        return _round_or_zero(cat_totals[k])
-            return 0
+                        return _round_or_none(cat_totals[k])
+            return None
 
         def detect_existing_emi():
             emi_amt = _get_raw(["repayment", "emi_monthly_total"], None) or _get_raw(["repayment", "monthly_emi_total"], None)
             if emi_amt is not None:
-                return _round_or_zero(emi_amt)
+                return _round_or_none(emi_amt)
             repayment_cat = _get_raw(["repayment", "category_totals"], None)
             if isinstance(repayment_cat, dict):
                 emi_like = repayment_cat.get("emi") or repayment_cat.get("loan_repayment") or repayment_cat.get("loan")
                 if emi_like is not None:
-                    return _round_or_zero(emi_like)
-            return 0
+                    return _round_or_none(emi_like)
+            return None
 
         def detect_other_loans_count():
             c = _get_raw(["repayment", "emi_count"], None) or _get_raw(["repayment", "loan_count"], None)
             try:
-                return int(c) if c is not None else 0
+                return int(c) if c is not None else None
             except Exception:
-                return 0
+                return None
 
         def detect_utility_bills_on_time():
             ub = _get_raw(["behaviour", "utility_bills_on_time"], None)
             if isinstance(ub, bool):
                 return ub
             eom = _get_raw(["behaviour", "end_of_month_stress_score"], None)
-            neg_bal = _get_raw(["cashflow", "negative_balance_count"], None) or 0
+            neg_bal = _get_raw(["cashflow", "negative_balance_count"], None)
             try:
                 if eom is not None:
-                    if float(eom) >= 0.6 and int(neg_bal) == 0:
+                    if float(eom) >= 0.6 and (neg_bal is None or int(neg_bal) == 0):
                         return True
                     if float(eom) < 0.4:
                         return False
             except Exception:
                 pass
-            return True  # conservative default
+            return None  # unknown
 
         # explicit UI-friendly values
         monthly_income_val = _get_raw(["income", "avg_monthly_income"], None) \
@@ -464,7 +468,22 @@ async def score_file(file: UploadFile = File(...)):
             or _get_raw(["income", "effective_total_income"], None) \
             or _get_raw(["income_raw", "effective_total_income"], None)
 
-        avg_bank_balance_val = _get_raw(["cashflow", "avg_monthly_balance"], None) or _get_raw(["cashflow", "avg_balance"], None)
+        # Robust avg balance lookup - log raw values to help debugging
+        try:
+            logger.debug("features.raw keys: %s", list(features.get("raw", {}).keys()))
+            logger.debug("raw cashflow object: %s", features.get("raw", {}).get("cashflow"))
+        except Exception:
+            pass
+
+        avg_bank_balance_val = (
+            _get_raw(["cashflow", "avg_monthly_balance"], None)
+            or _get_raw(["cashflow_raw", "avg_monthly_balance"], None)
+            or _get_raw(["cashflow", "avg_balance"], None)
+            or _get_raw(["cashflow_raw", "avg_balance"], None)
+            or _get_raw(["cashflow", "avg_monthly_balance_effective"], None)
+            or _get_raw(["cashflow", "avg_balance_monthly"], None)
+            or _get_raw(["cashflow", "avg_balance_inr"], None)
+        )
 
         monthly_rent_val = detect_monthly_rent()
         existing_emi_val = detect_existing_emi()
@@ -486,13 +505,13 @@ async def score_file(file: UploadFile = File(...)):
             "final_score": scoring,
             "created_at": str(pd.Timestamp.now()),
 
-            # UI-specific keys for frontend autofill
-            "monthlyIncome": _round_or_zero(monthly_income_val),
-            "avgBankBalance": _round_or_zero(avg_bank_balance_val),
-            "monthlyRent": monthly_rent_val,
-            "existingEmi": existing_emi_val,
-            "otherLoans": other_loans_val,
-            "utilityBillsOnTime": bool(utility_bills_on_time_val),
+            # UI-specific keys for frontend autofill (use None when unknown)
+            "monthlyIncome": _round_or_none(monthly_income_val),
+            "avgBankBalance": _round_or_none(avg_bank_balance_val),
+            "monthlyRent": monthly_rent_val if monthly_rent_val is not None else None,
+            "existingEmi": existing_emi_val if existing_emi_val is not None else None,
+            "otherLoans": other_loans_val if other_loans_val is not None else None,
+            "utilityBillsOnTime": bool(utility_bills_on_time_val) if utility_bills_on_time_val is not None else None,
             "employmentType": employment_type_val,
         }
 
