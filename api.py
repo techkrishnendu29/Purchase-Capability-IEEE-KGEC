@@ -192,12 +192,12 @@ def index(request: Request):
     # Build the two dynamic values separately
     health_data = health().body
     try:
-        # health().body may be bytes or str depending on implementation
         health_json = health_data.decode() if isinstance(health_data, (bytes, bytearray)) else str(health_data)
     except Exception:
         health_json = str(health_data)
 
-    score_url = request.url_for("score_file")
+    # Ensure score_url is a plain string (URL object -> str)
+    score_url = str(request.url_for("score_file"))
 
     # Use a plain triple-quoted string (no f-string) and inject the dynamic parts by concatenation.
     html = """
@@ -231,7 +231,6 @@ def index(request: Request):
     </html>
     """
     return HTMLResponse(content=html)
-
 
 def _pick_top_features(component_scores: Dict[str, float], raw: Dict[str, Any], top_k: int = 2) -> List[Dict[str, Any]]:
     comps_sorted = sorted(component_scores.items(), key=lambda kv: abs(kv[1] - 50), reverse=True)
