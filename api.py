@@ -416,7 +416,7 @@ async def score_file(file: UploadFile = File(...)):
             "employmentType": employment_type_val,
         }
 
-        # Save to in-memory store (developer mode)
+               # Save to in-memory store (developer mode)
         try:
             SUMMARIES[summary_id] = summary_obj
         except Exception:
@@ -424,6 +424,10 @@ async def score_file(file: UploadFile = File(...)):
 
         # include the id and set HttpOnly cookie so client can fetch easily
         resp["_statement_id"] = summary_id
+
+        # ADD THIS LINE -> include summary object directly in /score response
+        resp["_statement_summary"] = summary_obj
+
         jr = JSONResponse(content=resp)
         jr.set_cookie("statement_id", summary_id, max_age=SUMMARY_TTL_SECONDS, httponly=True, path="/")
         return jr
