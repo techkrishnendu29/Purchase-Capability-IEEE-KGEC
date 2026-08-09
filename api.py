@@ -189,33 +189,43 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    health_json = health().body.decode() if isinstance(health().body, (bytes, bytearray)) else str(health().body)
-    html = f"""
+    # Build the two dynamic values separately
+    health_data = health().body
+    try:
+        # health().body may be bytes or str depending on implementation
+        health_json = health_data.decode() if isinstance(health_data, (bytes, bytearray)) else str(health_data)
+    except Exception:
+        health_json = str(health_data)
+
+    score_url = request.url_for("score_file")
+
+    # Use a plain triple-quoted string (no f-string) and inject the dynamic parts by concatenation.
+    html = """
     <!doctype html>
     <html>
       <head><meta charset="utf-8"/><title>ProsperityScore API</title></head>
       <body style="font-family:Arial,Helvetica,sans-serif; margin:30px;">
         <h1>ProsperityScore API</h1>
-        <p>Health: <pre>{health_json}</pre></p>
+        <p>Health: <pre>""" + health_json + """</pre></p>
         <h3>Upload a CSV / XLS / XLSX bank statement</h3>
         <input id="file" type="file" accept=".csv,.xls,.xlsx"/>
         <button id="send">Upload & Score</button>
         <pre id="out"></pre>
         <script>
-          document.getElementById('send').onclick = async () => {{
+          document.getElementById('send').onclick = async function () {
             const f = document.getElementById('file').files[0];
-            if (!f) return alert('Select a file');
+            if (!f) { alert('Select a file'); return; }
             const fd = new FormData();
             fd.append('file', f);
             document.getElementById('out').textContent = 'Uploading...';
-            try {{
-              const resp = await fetch('{request.url_for("score_file")}', {{ method: 'POST', body: fd }});
+            try {
+              const resp = await fetch('""" + score_url + """', { method: 'POST', body: fd });
               const j = await resp.json();
               document.getElementById('out').textContent = JSON.stringify(j, null, 2);
-            }} catch (e) {{
+            } catch (e) {
               document.getElementById('out').textContent = 'Error: ' + e;
-            }}
-          }}};
+            }
+          };
         </script>
       </body>
     </html>
