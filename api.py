@@ -43,11 +43,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 app = FastAPI(title="ProsperityScore API (with summary store)")
 
+# CORS configuration: set FRONTEND_ORIGINS env to comma-separated origins, e.g. "http://localhost:3000"
+FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=True,  # allow cookies/credentials to be sent from frontend
 )
 
 # Config / Model
@@ -116,6 +119,7 @@ def health():
             "ml_helpers_available": ML_HELPERS_AVAILABLE,
             "ml_model_loaded": ML_MODEL_LOADED,
             "cwd": str(Path.cwd()),
+            "frontend_origins": FRONTEND_ORIGINS,
         }
     )
 
@@ -416,20 +420,22 @@ async def score_file(file: UploadFile = File(...)):
             "employmentType": employment_type_val,
         }
 
-               # Save to in-memory store (developer mode)
+        # Save to in-memory store (developer mode)
         try:
             SUMMARIES[summary_id] = summary_obj
         except Exception:
             logger.exception("Failed to save statement summary in memory")
 
-        # include the id and set HttpOnly cookie so client can fetch easily
+        # include the id and the parsed summary directly in the /score response
         resp["_statement_id"] = summary_id
-
-        # ADD THIS LINE -> include summary object directly in /score response
         resp["_statement_summary"] = summary_obj
 
+        # set cookie for fallback flows (use secure + samesite=None when FORCE_SECURE_COOKIES=true)
+        cookie_secure = os.environ.get("FORCE_SECURE_COOKIES", "false").lower() in ("1", "true", "yes")
+        samesite_val = "None" if cookie_secure else "Lax"
         jr = JSONResponse(content=resp)
-        jr.set_cookie("statement_id", summary_id, max_age=SUMMARY_TTL_SECONDS, httponly=True, path="/")
+        jr.set_cookie("statement_id", summary_id, max_age=SUMMARY_TTL_SECONDS, httponly=True,
+                      secure=cookie_secure, samesite=samesite_val, path="/")
         return jr
 
     finally:
