@@ -46,14 +46,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 app = FastAPI(title="ProsperityScore API (with summary store)")
 
-# CORS configuration: set FRONTEND_ORIGINS env to comma-separated origins, e.g. "http://localhost:3000"
+# CORS configuration: must be placed immediately after app creation.
+# Set FRONTEND_ORIGINS in your environment to the exact origin(s) of your frontend,
+# e.g. "https://app.example.com" or "http://localhost:3000".
 FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
-    allow_credentials=True,  # allow cookies/credentials to be sent from frontend
+    allow_credentials=True,  # required if frontend uses credentials: "include"
 )
 
 # Config / Model
@@ -80,7 +82,6 @@ def try_load_ml_model():
         ML_MODEL_LOADED = False
         return
 
-    # Preferred: use ml_categorizer.load_model if available
     if ML_HELPERS_AVAILABLE and ml_load_model is not None:
         try:
             ML_MODEL = ml_load_model(str(MODEL_PATH))
@@ -90,7 +91,6 @@ def try_load_ml_model():
         except Exception:
             logger.exception("preprocessing.ml_categorizer.load_model failed; falling back to joblib.load if available")
 
-    # Fallback: joblib.load
     if joblib_load is not None:
         try:
             ML_MODEL = joblib_load(str(MODEL_PATH))
@@ -104,7 +104,6 @@ def try_load_ml_model():
     ML_MODEL = None
     ML_MODEL_LOADED = False
 
-# Try load on startup
 try_load_ml_model()
 
 # In-memory summary store for quick frontend autofill (dev/test use only)
@@ -118,49 +117,40 @@ def _to_json_serializable(obj):
     Handles dataclasses, pandas (Series, Timestamp), numpy scalars/arrays, dicts, lists, tuples, sets.
     Falls back to str(obj) for unknown types.
     """
-    # None
     if obj is None:
         return None
-    # Primitive types
     if isinstance(obj, (str, bool)):
         return obj
     if isinstance(obj, Number):
-        # Convert numpy numbers to native Python
         try:
-            return obj.item()  # works for numpy scalars
+            # numpy scalars respond to .item()
+            return obj.item()
         except Exception:
             return obj
-    # Dataclass -> dict
     if dataclasses.is_dataclass(obj):
         try:
             return _to_json_serializable(dataclasses.asdict(obj))
         except Exception:
             return _to_json_serializable(dict(obj))
-    # pandas Series / Index
     if isinstance(obj, pd.Series):
         try:
-            # convert values to serializable dict keyed by index (stringified)
             return {str(k): _to_json_serializable(v) for k, v in obj.to_dict().items()}
         except Exception:
-            return obj.to_list()
+            return obj.tolist()
     if isinstance(obj, pd.DataFrame):
         try:
-            # convert to list of row dicts
             return [_to_json_serializable(dict(row)) for _, row in obj.iterrows()]
         except Exception:
             return obj.to_dict()
     if isinstance(obj, (pd.Timestamp, pd.Timedelta)):
         return str(obj)
-    # numpy arrays
-    if isinstance(obj, (np.ndarray,)):
+    if isinstance(obj, np.ndarray):
         try:
             return _to_json_serializable(obj.tolist())
         except Exception:
             return [ _to_json_serializable(x) for x in obj ]
-    # numpy scalar types
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
-    # dict
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -169,16 +159,13 @@ def _to_json_serializable(obj):
             except Exception:
                 out[str(k)] = str(v)
         return out
-    # list / tuple / set
     if isinstance(obj, (list, tuple, set)):
         return [_to_json_serializable(v) for v in obj]
-    # objects with tolist
     if hasattr(obj, "tolist"):
         try:
             return _to_json_serializable(obj.tolist())
         except Exception:
             pass
-    # Fallback: try str
     try:
         return str(obj)
     except Exception:
@@ -228,7 +215,7 @@ def index(request: Request):
             }} catch (e) {{
               document.getElementById('out').textContent = 'Error: ' + e;
             }}
-          }};
+          }}};
         </script>
       </body>
     </html>
@@ -288,7 +275,7 @@ async def score_file(file: UploadFile = File(...)):
             tmp.write(content)
             tmp.flush()
 
-        # parse using loader (robust header discovery and normalization)
+        # parse
         try:
             df = load_transaction_files([tmp_path])
         except Exception as e:
@@ -298,7 +285,7 @@ async def score_file(file: UploadFile = File(...)):
         if df is None or df.empty:
             raise HTTPException(status_code=400, detail="Uploaded file parsed but returned no transactions")
 
-        # categorize (prefer ML if requested & loaded)
+        # categorize
         df_cat = None
         if REQUEST_USE_ML and ML_MODEL_LOADED and predict_categories is not None:
             try:
@@ -349,12 +336,10 @@ async def score_file(file: UploadFile = File(...)):
             "top_features": top_features,
         }
 
-        # Build a compact summary for quick frontend autofill (don't store raw transactions)
+        # Build a compact summary for quick frontend autofill (UI-friendly; numeric fields default to 0)
         summary_id = str(uuid.uuid4())
 
-        # --- helper functions (local, use features captured from this scope) ---
         def _get_raw(path: List[str], default=None):
-            """Safe nested get from features['raw'] or direct dict-like objects."""
             try:
                 obj = features.get("raw", {})
                 for p in path:
@@ -369,11 +354,9 @@ async def score_file(file: UploadFile = File(...)):
                 return default
 
         def _round_or_none(v):
-            """Round numeric values to int, return None if value is None or cannot be parsed."""
             try:
                 if v is None:
                     return None
-                # treat NaN explicitly as None
                 if isinstance(v, (float, np.floating)) and np.isnan(v):
                     return None
                 return int(round(float(v)))
@@ -381,28 +364,18 @@ async def score_file(file: UploadFile = File(...)):
                 return None
 
         def infer_employment_type_from_features():
-            # Try explicit inference first
             emp = _get_raw(["income", "inferred_employment_type"], None) or _get_raw(["income_raw", "inferred_employment_type"], None)
             if emp and isinstance(emp, str):
                 emp = emp.strip()
                 if emp in ("Salaried", "Self-employed", "Business owner", "Gig / freelance"):
                     return emp
-
-            # Fallback heuristics
             avg_inc = _get_raw(["income", "avg_monthly_income"], None) or _get_raw(["income_raw", "avg_monthly_income"], None)
             stability = _get_raw(["income", "income_stability_score"], None) or _get_raw(["income_raw", "income_stability_score"], None)
             diversity = _get_raw(["income", "income_source_diversity_score"], None) or _get_raw(["income_raw", "income_source_diversity_score"], None)
-
             try:
                 diversity = float(diversity) if diversity is not None else None
             except Exception:
                 diversity = None
-
-            # Heuristics:
-            # - very single source (diversity ~1) & stable => Salaried
-            # - small number of sources => Self-employed
-            # - many sources => Business owner
-            # - low stability & many small credits => Gig / freelance
             if diversity is not None:
                 if diversity >= 0.9:
                     return "Salaried"
@@ -414,10 +387,9 @@ async def score_file(file: UploadFile = File(...)):
                     return "Business owner"
             if stability is not None and float(stability) >= 0.8 and avg_inc and float(avg_inc) > 0:
                 return "Salaried"
-            return "Self-employed"
+            return None
 
         def detect_monthly_rent():
-            # Try keys from expense raw, or check category totals
             rent = _get_raw(["expense", "monthly_rent_estimate"], None) or _get_raw(["expense", "rent_monthly"], None)
             if rent is not None:
                 return _round_or_none(rent)
@@ -460,15 +432,14 @@ async def score_file(file: UploadFile = File(...)):
                         return False
             except Exception:
                 pass
-            return None  # unknown
+            return None
 
-        # explicit UI-friendly values
         monthly_income_val = _get_raw(["income", "avg_monthly_income"], None) \
             or _get_raw(["income_raw", "avg_monthly_income"], None) \
             or _get_raw(["income", "effective_total_income"], None) \
             or _get_raw(["income_raw", "effective_total_income"], None)
 
-        # Robust avg balance lookup - log raw values to help debugging
+        # robust avg balance lookup (extra candidate keys)
         try:
             logger.debug("features.raw keys: %s", list(features.get("raw", {}).keys()))
             logger.debug("raw cashflow object: %s", features.get("raw", {}).get("cashflow"))
@@ -491,29 +462,29 @@ async def score_file(file: UploadFile = File(...)):
         utility_bills_on_time_val = detect_utility_bills_on_time()
         employment_type_val = infer_employment_type_from_features()
 
-        # --- build UI-friendly summary: use 0 for missing numeric values so frontend shows 0 instead of null ---
+        # UI-friendly: return 0 for numeric missing values (per your request)
         summary_obj = {
-    "id": summary_id,
-    "component_scores": features.get("component_scores"),
-    "features": {
-        "income": features.get("raw", {}).get("income") or features.get("raw", {}).get("income_raw"),
-        "cashflow": features.get("raw", {}).get("cashflow"),
-        "repayment": features.get("raw", {}).get("repayment"),
-        "expense": features.get("raw", {}).get("expense"),
-        "behaviour": features.get("raw", {}).get("behaviour"),
-    },
-    "top_features": top_features,
-    "final_score": scoring,
-    "created_at": str(pd.Timestamp.now()),
+            "id": summary_id,
+            "component_scores": features.get("component_scores"),
+            "features": {
+                "income": features.get("raw", {}).get("income") or features.get("raw", {}).get("income_raw"),
+                "cashflow": features.get("raw", {}).get("cashflow"),
+                "repayment": features.get("raw", {}).get("repayment"),
+                "expense": features.get("raw", {}).get("expense"),
+                "behaviour": features.get("raw", {}).get("behaviour"),
+            },
+            "top_features": top_features,
+            "final_score": scoring,
+            "created_at": str(pd.Timestamp.now()),
 
-    # UI-specific keys for frontend autofill — return 0 for missing numeric values
-    "monthlyIncome": _round_or_none(monthly_income_val) if _round_or_none(monthly_income_val) is not None else 0,
-    "avgBankBalance": _round_or_none(avg_bank_balance_val) if _round_or_none(avg_bank_balance_val) is not None else 0,
-    "monthlyRent": _round_or_none(monthly_rent_val) if monthly_rent_val is not None and _round_or_none(monthly_rent_val) is not None else 0,
-    "existingEmi": _round_or_none(existing_emi_val) if _round_or_none(existing_emi_val) is not None else 0,
-    "otherLoans": int(other_loans_val) if other_loans_val is not None else 0,
-    "utilityBillsOnTime": bool(utility_bills_on_time_val) if utility_bills_on_time_val is not None else False,
-    "employmentType": employment_type_val or "Salaried",
+            # UI-specific keys for frontend autofill — use 0 defaults to show 0 in UI
+            "monthlyIncome": _round_or_none(monthly_income_val) if _round_or_none(monthly_income_val) is not None else 0,
+            "avgBankBalance": _round_or_none(avg_bank_balance_val) if _round_or_none(avg_bank_balance_val) is not None else 0,
+            "monthlyRent": _round_or_none(monthly_rent_val) if _round_or_none(monthly_rent_val) is not None else 0,
+            "existingEmi": _round_or_none(existing_emi_val) if _round_or_none(existing_emi_val) is not None else 0,
+            "otherLoans": int(other_loans_val) if other_loans_val is not None else 0,
+            "utilityBillsOnTime": bool(utility_bills_on_time_val) if utility_bills_on_time_val is not None else False,
+            "employmentType": employment_type_val or "Salaried",
         }
 
         # Convert summary to JSON-serializable form before storing/returning
