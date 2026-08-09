@@ -49,7 +49,7 @@ app = FastAPI(title="ProsperityScore API (with summary store)")
 # CORS configuration: must be placed immediately after app creation.
 # Set FRONTEND_ORIGINS in your environment to the exact origin(s) of your frontend,
 # e.g. "https://app.example.com" or "http://localhost:3000".
-FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "https://prosperityscore.vercel.app").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
