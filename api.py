@@ -6,10 +6,13 @@ import tempfile
 import uuid
 import logging
 import traceback
+import dataclasses
 from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
+import numpy as np
+from numbers import Number
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Cookie, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,6 +112,79 @@ SUMMARIES: Dict[str, Dict[str, Any]] = {}
 SUMMARY_TTL_SECONDS = int(os.environ.get("SUMMARY_TTL", "600"))  # TTL not enforced in this simple store
 
 
+def _to_json_serializable(obj):
+    """
+    Recursively convert objects to JSON-serializable primitives.
+    Handles dataclasses, pandas (Series, Timestamp), numpy scalars/arrays, dicts, lists, tuples, sets.
+    Falls back to str(obj) for unknown types.
+    """
+    # None
+    if obj is None:
+        return None
+    # Primitive types
+    if isinstance(obj, (str, bool)):
+        return obj
+    if isinstance(obj, Number):
+        # Convert numpy numbers to native Python
+        try:
+            return obj.item()  # works for numpy scalars
+        except Exception:
+            return obj
+    # Dataclass -> dict
+    if dataclasses.is_dataclass(obj):
+        try:
+            return _to_json_serializable(dataclasses.asdict(obj))
+        except Exception:
+            return _to_json_serializable(dict(obj))
+    # pandas Series / Index
+    if isinstance(obj, pd.Series):
+        try:
+            # convert values to serializable dict keyed by index (stringified)
+            return {str(k): _to_json_serializable(v) for k, v in obj.to_dict().items()}
+        except Exception:
+            return obj.to_list()
+    if isinstance(obj, pd.DataFrame):
+        try:
+            # convert to list of row dicts
+            return [_to_json_serializable(dict(row)) for _, row in obj.iterrows()]
+        except Exception:
+            return obj.to_dict()
+    if isinstance(obj, (pd.Timestamp, pd.Timedelta)):
+        return str(obj)
+    # numpy arrays
+    if isinstance(obj, (np.ndarray,)):
+        try:
+            return _to_json_serializable(obj.tolist())
+        except Exception:
+            return [ _to_json_serializable(x) for x in obj ]
+    # numpy scalar types
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
+        return obj.item()
+    # dict
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            try:
+                out[str(k)] = _to_json_serializable(v)
+            except Exception:
+                out[str(k)] = str(v)
+        return out
+    # list / tuple / set
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_json_serializable(v) for v in obj]
+    # objects with tolist
+    if hasattr(obj, "tolist"):
+        try:
+            return _to_json_serializable(obj.tolist())
+        except Exception:
+            pass
+    # Fallback: try str
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 @app.get("/health", response_class=JSONResponse)
 def health():
     return JSONResponse(
@@ -177,7 +253,7 @@ def _pick_top_features(component_scores: Dict[str, float], raw: Dict[str, Any], 
                 "note": f"Lowest subscore: {worst_key}"
             })
         else:
-            numeric = {k: v for k, v in comp_raw.items() if isinstance(v, (int, float))}
+            numeric = {k: v for k, v in comp_raw.items() if isinstance(v, (int, float, np.integer, np.floating))}
             if numeric:
                 key = max(numeric.keys(), key=lambda kk: abs(numeric[kk]))
                 selected.append({
@@ -420,20 +496,35 @@ async def score_file(file: UploadFile = File(...)):
             "employmentType": employment_type_val,
         }
 
-        # Save to in-memory store (developer mode)
+        # Convert summary to JSON-serializable form before storing/returning
         try:
-            SUMMARIES[summary_id] = summary_obj
+            serializable_summary = _to_json_serializable(summary_obj)
+            SUMMARIES[summary_id] = serializable_summary
         except Exception:
-            logger.exception("Failed to save statement summary in memory")
+            logger.exception("Failed to serialize statement summary; saving fallback string")
+            serializable_summary = {"id": summary_id, "note": "serialization_failed"}
+            SUMMARIES[summary_id] = serializable_summary
 
-        # include the id and the parsed summary directly in the /score response
+        # include the id and the parsed (serializable) summary directly in the /score response
         resp["_statement_id"] = summary_id
-        resp["_statement_summary"] = summary_obj
+        resp["_statement_summary"] = serializable_summary
+
+        # Convert entire response to serializable form too (protects against numpy/pandas inside scoring result)
+        try:
+            serializable_resp = _to_json_serializable(resp)
+        except Exception:
+            logger.exception("Failed to serialize full response; falling back to minimal response")
+            serializable_resp = {
+                "component_scores": resp.get("component_scores"),
+                "final_score": str(resp.get("final_score")),
+                "_statement_id": summary_id,
+                "_statement_summary": serializable_summary,
+            }
 
         # set cookie for fallback flows (use secure + samesite=None when FORCE_SECURE_COOKIES=true)
         cookie_secure = os.environ.get("FORCE_SECURE_COOKIES", "false").lower() in ("1", "true", "yes")
         samesite_val = "None" if cookie_secure else "Lax"
-        jr = JSONResponse(content=resp)
+        jr = JSONResponse(content=serializable_resp)
         jr.set_cookie("statement_id", summary_id, max_age=SUMMARY_TTL_SECONDS, httponly=True,
                       secure=cookie_secure, samesite=samesite_val, path="/")
         return jr
