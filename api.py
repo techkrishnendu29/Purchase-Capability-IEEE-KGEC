@@ -271,6 +271,127 @@ async def score_file(file: UploadFile = File(...)):
 
         # Build a compact summary for quick frontend autofill (don't store raw transactions)
         summary_id = str(uuid.uuid4())
+
+        # --- helper functions (local, use features captured from this scope) ---
+        def _get_raw(path: List[str], default=None):
+            """Safe nested get from features['raw'] or direct dict-like objects."""
+            try:
+                obj = features.get("raw", {})
+                for p in path:
+                    if obj is None:
+                        return default
+                    if isinstance(obj, dict):
+                        obj = obj.get(p)
+                    else:
+                        obj = getattr(obj, p, None)
+                return obj if obj is not None else default
+            except Exception:
+                return default
+
+        def _round_or_zero(v):
+            try:
+                if v is None:
+                    return 0
+                return int(round(float(v)))
+            except Exception:
+                return 0
+
+        def infer_employment_type_from_features():
+            # Try explicit inference first
+            emp = _get_raw(["income", "inferred_employment_type"], None) or _get_raw(["income_raw", "inferred_employment_type"], None)
+            if emp and isinstance(emp, str):
+                emp = emp.strip()
+                if emp in ("Salaried", "Self-employed", "Business owner", "Gig / freelance"):
+                    return emp
+
+            # Fallback heuristics
+            avg_inc = _get_raw(["income", "avg_monthly_income"], None) or _get_raw(["income_raw", "avg_monthly_income"], None)
+            stability = _get_raw(["income", "income_stability_score"], None) or _get_raw(["income_raw", "income_stability_score"], None)
+            diversity = _get_raw(["income", "income_source_diversity_score"], None) or _get_raw(["income_raw", "income_source_diversity_score"], None)
+
+            try:
+                diversity = float(diversity) if diversity is not None else None
+            except Exception:
+                diversity = None
+
+            # Heuristics:
+            # - very single source (diversity ~1) & stable => Salaried
+            # - small number of sources => Self-employed
+            # - many sources => Business owner
+            # - low stability & many small credits => Gig / freelance
+            if diversity is not None:
+                if diversity >= 0.9:
+                    return "Salaried"
+                if diversity >= 0.6:
+                    return "Self-employed"
+                if diversity < 0.4:
+                    if stability is not None and float(stability) < 0.4:
+                        return "Gig / freelance"
+                    return "Business owner"
+            if stability is not None and float(stability) >= 0.8 and avg_inc and float(avg_inc) > 0:
+                return "Salaried"
+            return "Self-employed"
+
+        def detect_monthly_rent():
+            # Try keys from expense raw, or check category totals
+            rent = _get_raw(["expense", "monthly_rent_estimate"], None) or _get_raw(["expense", "rent_monthly"], None)
+            if rent is not None:
+                return _round_or_zero(rent)
+            cat_totals = _get_raw(["expense", "category_totals"], None) or _get_raw(["expense_raw", "category_totals"], None)
+            if isinstance(cat_totals, dict):
+                for k in ("rent", "house rent", "rental"):
+                    if k in cat_totals:
+                        return _round_or_zero(cat_totals[k])
+            return 0
+
+        def detect_existing_emi():
+            emi_amt = _get_raw(["repayment", "emi_monthly_total"], None) or _get_raw(["repayment", "monthly_emi_total"], None)
+            if emi_amt is not None:
+                return _round_or_zero(emi_amt)
+            repayment_cat = _get_raw(["repayment", "category_totals"], None)
+            if isinstance(repayment_cat, dict):
+                emi_like = repayment_cat.get("emi") or repayment_cat.get("loan_repayment") or repayment_cat.get("loan")
+                if emi_like is not None:
+                    return _round_or_zero(emi_like)
+            return 0
+
+        def detect_other_loans_count():
+            c = _get_raw(["repayment", "emi_count"], None) or _get_raw(["repayment", "loan_count"], None)
+            try:
+                return int(c) if c is not None else 0
+            except Exception:
+                return 0
+
+        def detect_utility_bills_on_time():
+            ub = _get_raw(["behaviour", "utility_bills_on_time"], None)
+            if isinstance(ub, bool):
+                return ub
+            eom = _get_raw(["behaviour", "end_of_month_stress_score"], None)
+            neg_bal = _get_raw(["cashflow", "negative_balance_count"], None) or 0
+            try:
+                if eom is not None:
+                    if float(eom) >= 0.6 and int(neg_bal) == 0:
+                        return True
+                    if float(eom) < 0.4:
+                        return False
+            except Exception:
+                pass
+            return True  # conservative default
+
+        # explicit UI-friendly values
+        monthly_income_val = _get_raw(["income", "avg_monthly_income"], None) \
+            or _get_raw(["income_raw", "avg_monthly_income"], None) \
+            or _get_raw(["income", "effective_total_income"], None) \
+            or _get_raw(["income_raw", "effective_total_income"], None)
+
+        avg_bank_balance_val = _get_raw(["cashflow", "avg_monthly_balance"], None) or _get_raw(["cashflow", "avg_balance"], None)
+
+        monthly_rent_val = detect_monthly_rent()
+        existing_emi_val = detect_existing_emi()
+        other_loans_val = detect_other_loans_count()
+        utility_bills_on_time_val = detect_utility_bills_on_time()
+        employment_type_val = infer_employment_type_from_features()
+
         summary_obj = {
             "id": summary_id,
             "component_scores": features.get("component_scores"),
@@ -284,6 +405,15 @@ async def score_file(file: UploadFile = File(...)):
             "top_features": top_features,
             "final_score": scoring,
             "created_at": str(pd.Timestamp.now()),
+
+            # UI-specific keys for frontend autofill
+            "monthlyIncome": _round_or_zero(monthly_income_val),
+            "avgBankBalance": _round_or_zero(avg_bank_balance_val),
+            "monthlyRent": monthly_rent_val,
+            "existingEmi": existing_emi_val,
+            "otherLoans": other_loans_val,
+            "utilityBillsOnTime": bool(utility_bills_on_time_val),
+            "employmentType": employment_type_val,
         }
 
         # Save to in-memory store (developer mode)
