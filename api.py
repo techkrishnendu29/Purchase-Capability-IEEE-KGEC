@@ -3,13 +3,14 @@
 from __future__ import annotations
 import os
 import tempfile
+import uuid
 import logging
 import traceback
 from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Cookie, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -40,7 +41,7 @@ except Exception:
 logger = logging.getLogger("prosperity_api")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-app = FastAPI(title="ProsperityScore API")
+app = FastAPI(title="ProsperityScore API (with summary store)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,6 +101,10 @@ def try_load_ml_model():
 # Try load on startup
 try_load_ml_model()
 
+# In-memory summary store for quick frontend autofill (dev/test use only)
+SUMMARIES: Dict[str, Dict[str, Any]] = {}
+SUMMARY_TTL_SECONDS = int(os.environ.get("SUMMARY_TTL", "600"))  # TTL not enforced in this simple store
+
 
 @app.get("/health", response_class=JSONResponse)
 def health():
@@ -125,7 +130,7 @@ def index(request: Request):
       <body style="font-family:Arial,Helvetica,sans-serif; margin:30px;">
         <h1>ProsperityScore API</h1>
         <p>Health: <pre>{health_json}</pre></p>
-        <h3>Upload transactions file (CSV / XLS / XLSX)</h3>
+        <h3>Upload a CSV / XLS / XLSX bank statement</h3>
         <input id="file" type="file" accept=".csv,.xls,.xlsx"/>
         <button id="send">Upload & Score</button>
         <pre id="out"></pre>
@@ -187,6 +192,7 @@ async def score_file(file: UploadFile = File(...)):
     """
     Accept one uploaded CSV/XLS/XLSX file, parse using preprocessing.loader.load_transaction_files,
     (optionally) categorize with ML, else rule-based, compute features & scoring and return JSON.
+    Also stores a compact parsed summary in-memory and sets an HttpOnly cookie so the frontend can fetch it.
     """
     fname = (file.filename or "upload").strip()
     ext = Path(fname).suffix.lower()
@@ -217,17 +223,17 @@ async def score_file(file: UploadFile = File(...)):
         if REQUEST_USE_ML and ML_MODEL_LOADED and predict_categories is not None:
             try:
                 df_cat = predict_categories(df, text_cols=("description", "payee"), model=ML_MODEL, out_col="category")
-                logger.info("Categorized using ML predict_categories")
-            except Exception:
-                logger.exception("ML predict_categories failed; falling back to rule-based")
+                logger.info("Categorized transactions using ML predict_categories")
+            except Exception as e:
+                logger.exception("ML predict_categories failed, falling back to rule-based: %s", e)
                 df_cat = None
 
         if df_cat is None:
             try:
                 df_cat = categorize_transactions(df, text_cols=("description", "payee"), use_ml=False)
-                logger.info("Categorized using rule-based categorize_transactions")
-            except Exception:
-                logger.exception("Rule-based categorize_transactions failed; proceeding with uncategorized")
+                logger.info("Categorized transactions using rule-based categorize_transactions")
+            except Exception as e:
+                logger.exception("Rule-based categorizer failed; proceeding with uncategorized: %s", e)
                 df_cat = df.copy()
                 df_cat["category"] = "Uncategorized"
 
@@ -262,7 +268,35 @@ async def score_file(file: UploadFile = File(...)):
             "explanations": explanations,
             "top_features": top_features,
         }
-        return JSONResponse(content=resp)
+
+        # Build a compact summary for quick frontend autofill (don't store raw transactions)
+        summary_id = str(uuid.uuid4())
+        summary_obj = {
+            "id": summary_id,
+            "component_scores": features.get("component_scores"),
+            "features": {
+                "income": features.get("raw", {}).get("income") or features.get("raw", {}).get("income_raw"),
+                "cashflow": features.get("raw", {}).get("cashflow"),
+                "repayment": features.get("raw", {}).get("repayment"),
+                "expense": features.get("raw", {}).get("expense"),
+                "behaviour": features.get("raw", {}).get("behaviour"),
+            },
+            "top_features": top_features,
+            "final_score": scoring,
+            "created_at": str(pd.Timestamp.now()),
+        }
+
+        # Save to in-memory store (developer mode)
+        try:
+            SUMMARIES[summary_id] = summary_obj
+        except Exception:
+            logger.exception("Failed to save statement summary in memory")
+
+        # include the id and set HttpOnly cookie so client can fetch easily
+        resp["_statement_id"] = summary_id
+        jr = JSONResponse(content=resp)
+        jr.set_cookie("statement_id", summary_id, max_age=SUMMARY_TTL_SECONDS, httponly=True, path="/")
+        return jr
 
     finally:
         # cleanup temp file
@@ -271,3 +305,19 @@ async def score_file(file: UploadFile = File(...)):
                 os.remove(tmp_path)
         except Exception:
             logger.exception("Failed to remove temporary file %s", tmp_path)
+
+
+@app.get("/api/statement/summary", response_class=JSONResponse)
+def get_statement_summary(id: str | None = Query(None, alias="id"), statement_id_cookie: str | None = Cookie(None)):
+    """
+    Return the parsed statement summary for the current client.
+    Accepts either ?id=<uuid> or the HttpOnly cookie 'statement_id'.
+    """
+    sid = id or statement_id_cookie
+    if not sid:
+        raise HTTPException(status_code=404, detail="No statement id provided")
+
+    summary = SUMMARIES.get(sid)
+    if not summary:
+        raise HTTPException(status_code=404, detail="No parsed statement summary available for this id")
+    return JSONResponse(content=summary)
