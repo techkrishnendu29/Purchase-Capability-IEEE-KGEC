@@ -491,28 +491,29 @@ async def score_file(file: UploadFile = File(...)):
         utility_bills_on_time_val = detect_utility_bills_on_time()
         employment_type_val = infer_employment_type_from_features()
 
+        # --- build UI-friendly summary: use 0 for missing numeric values so frontend shows 0 instead of null ---
         summary_obj = {
-            "id": summary_id,
-            "component_scores": features.get("component_scores"),
-            "features": {
-                "income": features.get("raw", {}).get("income") or features.get("raw", {}).get("income_raw"),
-                "cashflow": features.get("raw", {}).get("cashflow"),
-                "repayment": features.get("raw", {}).get("repayment"),
-                "expense": features.get("raw", {}).get("expense"),
-                "behaviour": features.get("raw", {}).get("behaviour"),
-            },
-            "top_features": top_features,
-            "final_score": scoring,
-            "created_at": str(pd.Timestamp.now()),
+    "id": summary_id,
+    "component_scores": features.get("component_scores"),
+    "features": {
+        "income": features.get("raw", {}).get("income") or features.get("raw", {}).get("income_raw"),
+        "cashflow": features.get("raw", {}).get("cashflow"),
+        "repayment": features.get("raw", {}).get("repayment"),
+        "expense": features.get("raw", {}).get("expense"),
+        "behaviour": features.get("raw", {}).get("behaviour"),
+    },
+    "top_features": top_features,
+    "final_score": scoring,
+    "created_at": str(pd.Timestamp.now()),
 
-            # UI-specific keys for frontend autofill (use None when unknown)
-            "monthlyIncome": _round_or_none(monthly_income_val),
-            "avgBankBalance": _round_or_none(avg_bank_balance_val),
-            "monthlyRent": monthly_rent_val if monthly_rent_val is not None else None,
-            "existingEmi": existing_emi_val if existing_emi_val is not None else None,
-            "otherLoans": other_loans_val if other_loans_val is not None else None,
-            "utilityBillsOnTime": bool(utility_bills_on_time_val) if utility_bills_on_time_val is not None else None,
-            "employmentType": employment_type_val,
+    # UI-specific keys for frontend autofill — return 0 for missing numeric values
+    "monthlyIncome": _round_or_none(monthly_income_val) if _round_or_none(monthly_income_val) is not None else 0,
+    "avgBankBalance": _round_or_none(avg_bank_balance_val) if _round_or_none(avg_bank_balance_val) is not None else 0,
+    "monthlyRent": _round_or_none(monthly_rent_val) if monthly_rent_val is not None and _round_or_none(monthly_rent_val) is not None else 0,
+    "existingEmi": _round_or_none(existing_emi_val) if _round_or_none(existing_emi_val) is not None else 0,
+    "otherLoans": int(other_loans_val) if other_loans_val is not None else 0,
+    "utilityBillsOnTime": bool(utility_bills_on_time_val) if utility_bills_on_time_val is not None else False,
+    "employmentType": employment_type_val or "Salaried",
         }
 
         # Convert summary to JSON-serializable form before storing/returning
